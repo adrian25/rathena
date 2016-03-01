@@ -1296,6 +1296,16 @@ bool pc_authok(struct map_session_data *sd, uint32 login_id2, time_t expiration_
 	sd->bonus_script.head = NULL;
 	sd->bonus_script.count = 0;
 
+	// Check EXP overflow, since previous rev EXP on Max Level is UINT_MAX
+	if (pc_is_maxbaselv(sd) && sd->status.base_exp >= MAX_LEVEL_BASE_EXP) {
+		sd->status.base_exp = MAX_LEVEL_BASE_EXP;
+		clif_updatestatus(sd, SP_BASEEXP);
+	}
+	if (pc_is_maxjoblv(sd) && sd->status.job_exp >= MAX_LEVEL_JOB_EXP) {
+		sd->status.job_exp = MAX_LEVEL_JOB_EXP;
+		clif_updatestatus(sd, SP_JOBEXP);
+	}
+
 	// Request all registries (auth is considered completed whence they arrive)
 	intif_request_registry(sd,7);
 	return true;
@@ -6370,13 +6380,19 @@ static void pc_calcexp(struct map_session_data *sd, unsigned int *base_exp, unsi
 			bonus += ( sd->sc.data[SC_EXPBOOST]->val1 / battle_config.vip_bm_increase );
 	}
 
-	*base_exp = (unsigned int) cap_value(*base_exp + (double)*base_exp * (bonus + vip_bonus_base)/100., 1, UINT_MAX);
+	if (*base_exp) {
+		unsigned int exp = (unsigned int)(*base_exp + (double)*base_exp * (bonus + vip_bonus_base)/100.);
+		*base_exp =  cap_value(exp, 1, UINT_MAX);
+	}
 
 	// Give JEXPBOOST for quests even if src is NULL.
 	if (&sd->sc && sd->sc.data[SC_JEXPBOOST])
 		bonus += sd->sc.data[SC_JEXPBOOST]->val1;
 
-	*job_exp = (unsigned int) cap_value(*job_exp + (double)*job_exp * (bonus + vip_bonus_job)/100., 1, UINT_MAX);
+	if (*job_exp) {
+		unsigned int exp = (unsigned int)(*job_exp + (double)*job_exp * (bonus + vip_bonus_job)/100.);
+		*job_exp = cap_value(exp, 1, UINT_MAX);
+	}
 
 	return;
 }
@@ -6413,7 +6429,6 @@ void pc_gainexp_disp(struct map_session_data *sd, unsigned int base_exp, unsigne
  **/
 int pc_gainexp(struct map_session_data *sd, struct block_list *src, unsigned int base_exp, unsigned int job_exp, bool quest)
 {
-	float nextbp = 0, nextjp = 0;
 	unsigned int nextb = 0, nextj = 0;
 	uint8 flag = 0; ///< 1: Base EXP given, 2: Job EXP given, 4: Max Base level, 8: Max Job Level
 
@@ -6428,40 +6443,34 @@ int pc_gainexp(struct map_session_data *sd, struct block_list *src, unsigned int
 	if(sd->status.guild_id>0)
 		base_exp-=guild_payexp(sd,base_exp);
 
+	flag = ((base_exp) ? 1 : 0) |
+		((job_exp) ? 2 : 0) |
+		((pc_is_maxbaselv(sd)) ? 4 : 0) |
+		((pc_is_maxjoblv(sd)) ? 8 : 0);
+
 	pc_calcexp(sd, &base_exp, &job_exp, src);
 
 	nextb = pc_nextbaseexp(sd);
 	nextj = pc_nextjobexp(sd);
-	
-	flag = ((base_exp) ? 1 : 0) |
-			((job_exp) ? 2 : 0) |
-			(pc_is_maxbaselv(sd) ? 4 : 0) |
-			(pc_is_maxjoblv(sd) ? 8 : 0);
 
+	// If reach max level and max exp, set the gained exp to 0
 	if (flag&4 && sd->status.base_exp >= MAX_LEVEL_BASE_EXP)
 		base_exp = 0;
 	if (flag&8 && sd->status.job_exp >= MAX_LEVEL_JOB_EXP)
 		job_exp = 0;
 
-	if ((base_exp || job_exp) && (sd->state.showexp || battle_config.max_exp_gain_rate)){
-		if (nextb > 0)
-			nextbp = (float) base_exp / (float) nextb;
-		if (nextj > 0)
-			nextjp = (float) job_exp / (float) nextj;
-
-		if(battle_config.max_exp_gain_rate) {
-			if (nextbp > battle_config.max_exp_gain_rate/1000.) {
-				//Note that this value should never be greater than the original
-				//base_exp, therefore no overflow checks are needed. [Skotlex]
+	if (battle_config.max_exp_gain_rate && (base_exp || job_exp)) {
+		//Note that this value should never be greater than the original
+		//therefore no overflow checks are needed. [Skotlex]
+		if (nextb > 0) {
+			float nextbp = (float) base_exp / (float) nextb;
+			if (nextbp > battle_config.max_exp_gain_rate/1000.)
 				base_exp = (unsigned int)(battle_config.max_exp_gain_rate/1000.*nextb);
-				if (sd->state.showexp)
-					nextbp = (float) base_exp / (float) nextb;
-			}
-			if (nextjp > battle_config.max_exp_gain_rate/1000.) {
+		}
+		if (nextj > 0) {
+			float nextjp = (float) job_exp / (float) nextj;
+			if (nextjp > battle_config.max_exp_gain_rate/1000.)
 				job_exp = (unsigned int)(battle_config.max_exp_gain_rate/1000.*nextj);
-				if (sd->state.showexp)
-					nextjp = (float) job_exp / (float) nextj;
-			}
 		}
 	}
 
@@ -6485,6 +6494,7 @@ int pc_gainexp(struct map_session_data *sd, struct block_list *src, unsigned int
 			clif_updatestatus(sd,SP_JOBEXP);
 	}
 
+	// Notify EXP. If player is max level, always show as 0
 	if (flag&1)
 		clif_displayexp(sd, (flag&4) ? 0 : base_exp, SP_BASEEXP, quest, false);
 	if (flag&2)
@@ -7891,17 +7901,59 @@ bool pc_setparam(struct map_session_data *sd,int type,int val)
 		sd->status.zeny = cap_value(val, 0, MAX_ZENY);
 		break;
 	case SP_BASEEXP:
-		if(pc_nextbaseexp(sd) > 0) {
+		{
+			unsigned int exp = sd->status.base_exp;
+			unsigned int next = pc_nextbaseexp(sd);
+			bool isLost = false;
+			bool isMax = false;
+
+			val = cap_value(val, 0, INT_MAX);
 			sd->status.base_exp = val;
-			if (!pc_checkbaselevelup(sd))
-				clif_updatestatus(sd, SP_BASEEXP);
+
+			if ((unsigned int)val < exp) { // Lost
+				exp -= val;
+				isLost = true;
+			}
+			else { // Gained
+				if ((isMax = pc_is_maxbaselv(sd)) && sd->status.base_exp >= MAX_LEVEL_BASE_EXP)
+					exp = 0;
+				else
+					exp = val-exp;
+				pc_checkbaselevelup(sd);
+				if (sd->status.base_exp > next) // Overflow check if reached max base level
+					sd->status.base_exp = next;
+			}
+			clif_displayexp(sd, isMax ? 0 : exp, SP_BASEEXP, false, isLost);
+			if (sd->state.showexp)
+				pc_gainexp_disp(sd, exp, next, 0, pc_nextjobexp(sd), isLost);
 		}
 		break;
 	case SP_JOBEXP:
-		if(pc_nextjobexp(sd) > 0) {
+		{
+			unsigned int exp = sd->status.job_exp;
+			unsigned int next = pc_nextjobexp(sd);
+			bool isLost = false;
+			bool isMax = false;
+
+			val = cap_value(val, 0, INT_MAX);
 			sd->status.job_exp = val;
-			if (!pc_checkjoblevelup(sd))
-				clif_updatestatus(sd, SP_JOBEXP);
+
+			if ((unsigned int)val < exp) { // Lost
+				exp -= val;
+				isLost = true;
+			}
+			else { // Gained
+				if ((isMax = pc_is_maxjoblv(sd)) && sd->status.job_exp >= MAX_LEVEL_JOB_EXP)
+					exp = 0;
+				else
+					exp = val-exp;
+				pc_checkjoblevelup(sd);
+				if (sd->status.job_exp > next) // Overflow check if reached max job level
+					sd->status.job_exp = next;
+			}
+			clif_displayexp(sd, isMax ? 0 : exp, SP_JOBEXP, false, isLost);
+			if (sd->state.showexp)
+				pc_gainexp_disp(sd, 0, pc_nextbaseexp(sd), exp, next, isLost);
 		}
 		break;
 	case SP_SEX:
